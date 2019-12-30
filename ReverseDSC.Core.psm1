@@ -1,12 +1,36 @@
 $Global:CredsRepo = @()
 
-<## This function receives the path to a DSC module, and a parameter name. It then returns the type associated with the parameter (int, string, etc.). #>
 function Get-DSCParamType
 {
+<#
+.SYNOPSIS
+Retrieves the data type of a specific parameter from the associated DSC
+resource.
+
+.DESCRIPTION
+This function scans the specified module (or in this case DSC resource),
+checks for the specified parameter inside the .schema.mof file associated
+with that module and properly assesses and returns the Data Type assigned
+to the parameter.
+
+.PARAMETER ModulePath
+Full file path to the .psm1 module we are looking for the property inside of.
+In most cases this will be the full path to the .psm1 file of the DSC resource.
+
+.PARAMETER ParamName
+Name of the parameter in the module we want to determine the Data Type for.
+
+#>
     [CmdletBinding()]
+    [OutputType([System.String])]
     param(
-        [parameter(Mandatory = $true)] [System.String] $ModulePath,
-        [parameter(Mandatory = $true)] [System.String] $ParamName
+        [parameter(Mandatory = $true)]
+        [System.String]
+        $ModulePath,
+
+        [parameter(Mandatory = $true)]
+        [System.String]
+        $ParamName
     )
 
     $tokens = $null
@@ -14,42 +38,42 @@ function Get-DSCParamType
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($ModulePath, [ref] $tokens, [ref] $errors)
     $functions = $ast.FindAll( {$args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst]}, $true)
 
-    $functions | ForEach-Object{
-        if ($_.Name -eq "Set-TargetResource")
+    ForEach($function in $functions){
+        if ($function.Name -eq "Set-TargetResource")
         {
-            $functionAst = [System.Management.Automation.Language.Parser]::ParseInput($_.Body, [ref] $tokens, [ref] $errors)
+            $functionAst = [System.Management.Automation.Language.Parser]::ParseInput($function.Body, [ref] $tokens, [ref] $errors)
 
             $parameters = $functionAst.FindAll( {$args[0] -is [System.Management.Automation.Language.ParameterAst]}, $true)
-            $parameters | ForEach-Object{
-                if ($_.Name.Extent.Text -eq $ParamName)
+            ForEach($parameter in $parameters){
+                if ($parameter.Name.Extent.Text -eq $ParamName)
                 {
-                    $attributes = $_.Attributes
-                    $attributes | ForEach-Object{
-                        if ($_.TypeName.FullName -like "System.*")
+                    $attributes = $parameter.Attributes
+                    ForEach($attribute in $attributes){
+                        if ($attribute.TypeName.FullName -like "System.*")
                         {
-                            return $_.TypeName.FullName
+                            return $attribute.TypeName.FullName
                         }
-                        elseif ($_.TypeName.FullName.ToLower() -eq "microsoft.management.infrastructure.ciminstance")
+                        elseif ($attribute.TypeName.FullName.ToLower() -eq "microsoft.management.infrastructure.ciminstance")
                         {
                             return "System.Collections.Hashtable"
                         }
-                        elseif ($_.TypeName.FullName.ToLower() -eq "string")
+                        elseif ($attribute.TypeName.FullName.ToLower() -eq "string")
                         {
                             return "System.String"
                         }
-                        elseif ($_.TypeName.FullName.ToLower() -eq "boolean")
+                        elseif ($attribute.TypeName.FullName.ToLower() -eq "boolean")
                         {
                             return "System.Boolean"
                         }
-                        elseif ($_.TypeName.FullName.ToLower() -eq "bool")
+                        elseif ($attribute.TypeName.FullName.ToLower() -eq "bool")
                         {
                             return "System.Boolean"
                         }
-                        elseif ($_.TypeName.FullName.ToLower() -eq "string[]")
+                        elseif ($attribute.TypeName.FullName.ToLower() -eq "string[]")
                         {
                             return "System.String[]"
                         }
-                        elseif ($_.TypeName.FullName.ToLower() -eq "microsoft.management.infrastructure.ciminstance[]")
+                        elseif ($attribute.TypeName.FullName.ToLower() -eq "microsoft.management.infrastructure.ciminstance[]")
                         {
                             return "Microsoft.Management.Infrastructure.CimInstance[]"
                         }
@@ -58,23 +82,50 @@ function Get-DSCParamType
             }
         }
      }
-     return $null
  }
 
-
-<## This function loops through a HashTable and returns a string that combines all the Key/Value pairs into a DSC param block. #>
 function Get-DSCBlock
 {
+<#
+.SYNOPSIS
+Generate the DSC string representing the resource's instance.
+
+.DESCRIPTION
+This function is really the core of ReverseDSC. It takes in an array of
+parameters and returns the DSC string that represents the given instance
+of the specified resource.
+
+.PARAMETER ModulePath
+Full file path to the .psm1 module we are looking to get an instance of.
+In most cases this will be the full path to the .psm1 file of the DSC resource.
+
+.PARAMETER Params
+Hashtable that contains the list of Key properties and their values.
+
+#>
     [CmdletBinding()]
+    [OutputType([System.String])]
     param(
-        [System.String] $ModulePath,
-        [System.Collections.Hashtable] $Params,
-        [switch] $UseGetTargetResource = $false
+        [Parameter(Mandatory = $true)]
+        [System.String]
+        $ModulePath,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.Hashtable]
+        $Params
     )
+
+    $Sorted = $Params.GetEnumerator() | Sort-Object -Property Name
+    $NewParams = [Ordered]@{}
+
+    foreach($entry in $Sorted)
+    {
+        $NewParams.Add($entry.Key, $entry.Value)
+    }
 
     # Figure out what parameter has the longuest name, and get its Length;
     $maxParamNameLength = 0
-    foreach ($param in $Params.Keys)
+    foreach ($param in $NewParams.Keys)
     {
         if ($param.Length -gt $maxParamNameLength)
         {
@@ -89,62 +140,55 @@ function Get-DSCBlock
     }
 
     $dscBlock = ""
-    $Params.Keys | ForEach-Object {
-        if ($UseGetTargetResource)
+    $NewParams.Keys | ForEach-Object {
+        if ($null -ne $NewParams[$_])
         {
-            $paramType = Get-DSCParamType -ModulePath $ModulePath -ParamName "`$$_"
+            $paramType = $NewParams[$_].GetType().Name
         }
         else
         {
-            if ($null -ne $Params[$_])
-            {
-                $paramType = $Params[$_].GetType().Name
-            }
-            else
-            {
-                $paramType = Get-DSCParamType -ModulePath $ModulePath -ParamName "`$$_"
-            }
+            $paramType = Get-DSCParamType -ModulePath $ModulePath -ParamName "`$$_"
         }
 
         $value = $null
-        if ($paramType -eq "System.String" -or $paramType -eq "String")
+        if ($paramType -eq "System.String" -or $paramType -eq "String" -or $paramType -eq "Guid" -or $paramType -eq 'TimeSpan')
         {
-            if (!$null -eq $Params.Item($_))
+            if (!$null -eq $NewParams.Item($_))
             {
-                $value = "`"" + $Params.Item($_).ToString().Replace("`"", "```"") + "`""
+                $value = "`"" + $NewParams.Item($_).ToString().Replace("`"", "```"") + "`""
             }
             else
             {
-                $value = "`"" + $Params.Item($_) + "`""
+                $value = "`"" + $NewParams.Item($_) + "`""
             }
         }
         elseif ($paramType -eq "System.Boolean" -or $paramType -eq "Boolean")
         {
-            $value = "`$" + $Params.Item($_)
+            $value = "`$" + $NewParams.Item($_)
         }
         elseif ($paramType -eq "System.Management.Automation.PSCredential")
         {
-            if ($null -ne $Params.Item($_))
+            if ($null -ne $NewParams.Item($_))
             {
-                if ($Params.Item($_).ToString() -like "`$Creds*")
+                if ($NewParams.Item($_).ToString() -like "`$Creds*")
                 {
-                    $value = $Params.Item($_).Replace("-", "_").Replace(".", "_")
+                    $value = $NewParams.Item($_).Replace("-", "_").Replace(".", "_")
                 }
                 else
                 {
-                    if ($null -eq $Params.Item($_).UserName)
+                    if ($null -eq $NewParams.Item($_).UserName)
                     {
-                        $value = "`$Creds" + ($Params.Item($_).Split('\'))[1].Replace("-", "_").Replace(".", "_")
+                        $value = "`$Creds" + ($NewParams.Item($_).Split('\'))[1].Replace("-", "_").Replace(".", "_")
                     }
                     else
                     {
-                        if ($Params.Item($_).UserName.Contains("@") -and !$Params.Item($_).UserName.COntains("\"))
+                        if ($NewParams.Item($_).UserName.Contains("@") -and !$NewParams.Item($_).UserName.COntains("\"))
                         {
-                            $value = "`$Creds" + ($Params.Item($_).UserName.Split('@'))[0]
+                            $value = "`$Creds" + ($NewParams.Item($_).UserName.Split('@'))[0]
                         }
                         else
                         {
-                            $value = "`$Creds" + ($Params.Item($_).UserName.Split('\'))[1].Replace("-", "_").Replace(".", "_")
+                            $value = "`$Creds" + ($NewParams.Item($_).UserName.Split('\'))[1].Replace("-", "_").Replace(".", "_")
                         }
                     }
                 }
@@ -154,25 +198,25 @@ function Get-DSCBlock
                 $value = "Get-Credential -Message " + $_
             }
         }
-        elseif ($paramType -eq "System.Collections.Hashtable")
+        elseif ($paramType -eq "System.Collections.Hashtable" -or $paramType -eq "Hashtable")
         {
             $value = "@{"
-            $hash = $Params.Item($_)
+            $hash = $NewParams.Item($_)
             $hash.Keys | foreach-object {
                 try
                 {
                     $value += $_ + " = `"" + $hash.Item($_) + "`"; "
-                    $value += "}"
                 }
                 catch
                 {
                     $value = $hash
                 }
             }
+            $value += "}"
         }
         elseif ($paramType -eq "System.String[]" -or $paramType -eq "String[]" -or $paramType -eq "ArrayList" -or $paramType -eq "List``1")
         {
-            $hash = $Params.Item($_)
+            $hash = $NewParams.Item($_)
             if ($hash -and !$hash.ToString().StartsWith("`$ConfigurationData."))
             {
                 $value = "@("
@@ -199,7 +243,7 @@ function Get-DSCBlock
         }
         elseif ($paramType -eq "System.UInt32[]")
         {
-            $hash = $Params.Item($_)
+            $hash = $NewParams.Item($_)
             if ($hash)
             {
                 $value = "@("
@@ -226,7 +270,7 @@ function Get-DSCBlock
         }
         elseif ($paramType -eq "Object[]" -or $paramType -eq "Microsoft.Management.Infrastructure.CimInstance[]")
         {
-            $array = $hash = $Params.Item($_)
+            $array = $hash = $NewParams.Item($_)
 
             if ($array.Length -gt 0 -and ($array[0].GetType().Name -eq "String" -and $paramType -ne "Microsoft.Management.Infrastructure.CimInstance[]"))
             {
@@ -251,23 +295,23 @@ function Get-DSCBlock
         }
         elseif ($paramType -eq "CimInstance")
         {
-            $value = $Params[$_]
+            $value = $NewParams[$_]
         }
         else
         {
-            if ($null -eq $Params[$_])
+            if ($null -eq $NewParams[$_])
             {
                 $value = "`$null"
             }
             else
             {
-                if($Params[$_].GetType().BaseType.Name -eq "Enum")
+                if($NewParams[$_].GetType().BaseType.Name -eq "Enum")
                 {
-                    $value = "`"" + $Params.Item($_) + "`""
+                    $value = "`"" + $NewParams.Item($_) + "`""
                 }
                 else
                 {
-                    $value = $Params.Item($_)
+                    $value = $NewParams.Item($_)
                 }
             }
         }
@@ -286,11 +330,29 @@ function Get-DSCBlock
     return $dscBlock
 }
 
-<## This function generates an empty hash containing fakes values for all input parameters of a Get-TargetResource function. #>
-function Get-DSCFakeParameters{
+function Get-DSCFakeParameters
+{
+<#
+.SYNOPSIS
+Generates a hashtable containing all the properties exposed by the specified
+DSC resource but with fake values.
+
+.DESCRIPTION
+This function scans the specified resources, create a hashtable with all the
+properties it exposes and generates fake values for each property based on
+the Data Type assigned to it.
+
+.PARAMETER ModulePath
+Full file path to the .psm1 module we are looking to get an instance of.
+In most cases this will be the full path to the .psm1 file of the DSC resource.
+
+#>
     [CmdletBinding()]
+    [OutputType([System.Collections.Hashtable])]
     param(
-        [parameter(Mandatory = $true)] [System.String] $ModulePath
+        [Parameter(Mandatory = $true)]
+        [System.String]
+        $ModulePath
     )
 
     $params = @{}
@@ -360,10 +422,33 @@ function Get-DSCFakeParameters{
      return $params
 }
 
-function Get-DSCDependsOnBlock($dependsOnItems)
+function Get-DSCDependsOnBlock
 {
+<#
+.SYNOPSIS
+Generates a string that represents the DependsOn clause based on the received
+list of dependencies.
+
+.DESCRIPTION
+This function receives an array of string that represents the list of DSC
+resource dependencies for the current DSC block and generates a string
+that represents the associated DependsOn DSC string.
+
+.PARAMETER DependsOnItems
+Array of string values that represent the list of depdencies for the
+current DSC block. Object in the array are expected to be in the form of:
+[<DSCResourceName>]<InstanceName>.
+
+#>
+    [CmdletBinding()]
+    [OutputType([System.String])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Object[]]
+        $DependsOnItems
+    )
     $dependsOnClause = "@("
-    foreach ($clause in $dependsOnItems)
+    foreach ($clause in $DependsOnItems)
     {
         $dependsOnClause += "`"" + $clause + "`","
     }
@@ -372,80 +457,32 @@ function Get-DSCDependsOnBlock($dependsOnItems)
     return $dependsOnClause
 }
 
-function Export-TargetResource()
-{
-    [CmdletBinding()]
-    param(
-        [parameter(Mandatory = $true)] [System.String] $ResourceName,
-        [parameter(Mandatory = $true)] [System.Collections.Hashtable] $MandatoryParameters,
-        [parameter(Mandatory = $false)] [System.String] $DependsOnClause
-    )
-    $ModulePath = (Get-DscResource $ResourceName | select-object Path).Path.ToString()
-    $friendlyName = Get-ResourceFriendlyName -ModulePath $ModulePath
-    $fakeParameters = Get-DSCFakeParameters -ModulePath $ModulePath
-
-    <# Nik20170109 - Replace each Fake Parameter by the ones received as function arguments #>
-    $finalParams = @{}
-    foreach ($fakeParameter in $fakeParameters.Keys)
-    {
-        if ($MandatoryParameters.ContainsKey($fakeParameter))
-        {
-            $finalParams.Add($fakeParameter,$MandatoryParameters.Get_Item($fakeParameter))
-        }
-    }
-
-    Import-Module $ModulePath
-    $results = Get-TargetResource @finalParams
-
-    $DSCBlockParams = @{}
-    foreach ($fakeParameter in $fakeParameters.Keys)
-    {
-        if ($results[$fakeParameter])
-        {
-            $DSCBlockParams.Add($fakeParameter,$results.Get_Item($fakeParameter))
-        }
-        else
-        {
-            $DSCBlockParams.Add($fakeParameter,"")
-        }
-    }
-
-    $exportContent = "        " + $ResourceName + " " + [System.Guid]::NewGuid().ToString() + "`r`n"
-    $exportContent += "        {`r`n"
-    $exportContent += Get-DSCBlock -ModulePath $ModulePath -Params $DSCBlockParams
-    if ($null -ne $DependsOnClause)
-    {
-        $exportContent += $DependsOnClause
-    }
-    $exportContent += "        }`r`n"
-    return $exportContent
-}
-
-function Get-ResourceFriendlyName
-{
-    [CmdletBinding()]
-    param(
-        [parameter(Mandatory = $true)] [System.String] $ModulePath
-    )
-
-    $tokens = $null
-    $errors = $null
-    $schemaPath = $ModulePath.Replace(".psm1", ".schema.mof")
-    $ast = [System.Management.Automation.Language.Parser]::ParseFile($schemaPath, [ref] $tokens, [ref] $errors)
-
-    for ($i = 0; $i -lt $tokens.Length; $i++)
-    {
-        if ($tokens[$i].Text.ToLower() -eq "friendlyname" -and ($i+2) -le $tokens.Length)
-        {
-            return $tokens[$i+2].Text.Replace("`"", "")
-        }
-    }
-    return $null
-}
-
 <# Region Helper Methods #>
-function Get-Credentials([string] $UserName)
+function Get-Credentials
 {
+<#
+.SYNOPSIS
+Returns the full username of (<domain>\<username>) of the specified user
+if it is already stroed in our credentials hashtable.
+
+.DESCRIPTION
+This function checks in the hashtable that stores all the required
+credentials (service account, etc.) for our configuration and
+returns the fully formatted username.
+
+.PARAMETER UserName
+Name of the user we wish to check to see if it is already stored in our
+credentials hashtable.
+
+#>
+    [CmdletBinding()]
+    [OutputType([System.String])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.String]
+        $UserName
+    )
+    
     if ($Global:CredsRepo.Contains($UserName.ToLower()))
     {
         return $UserName.ToLower()
@@ -453,8 +490,31 @@ function Get-Credentials([string] $UserName)
     return $null
 }
 
-function Resolve-Credentials([string] $UserName)
+function Resolve-Credentials
 {
+<#
+.SYNOPSIS
+Returns a string representing the name of the PSCredential variable
+associated with the specific username.
+
+.DESCRIPTION
+This function takes in a specified user name and returns what the standardized
+variable name for that user should be inside of our extracted DSC configuration.
+Credentials variables will always be named $Creds<username> as a standard for
+ReverseDSC. This function makes sure that the variable name doesn't contain
+character that are invalid in variable names bu might be valid in Usernames.
+
+.PARAMETER UserName
+Name of the user we wish to get the associated variable name from.
+
+#>
+    [CmdletBinding()]
+    [OutputType([System.String])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.String]
+        $UserName
+    )
     $userNameParts = $UserName.ToLower().Split('\')
     if ($userNameParts.Length -gt 1)
     {
@@ -463,16 +523,55 @@ function Resolve-Credentials([string] $UserName)
     return "`$Creds" + $UserName.Replace("-","_").Replace(".", "_").Replace(" ", "").Replace("@","")
 }
 
-function Save-Credentials([string] $UserName)
+function Save-Credentials
 {
+<#
+.SYNOPSIS
+Adds the specified username to our central list of required credentials.
+
+.DESCRIPTION
+This function checks to see if the specified user is already stored in our
+central required credentials list, and if not simply adds it to it.
+
+.PARAMETER UserName
+Username to add to the central list of required credentials.
+
+#>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.String]
+        $UserName
+    )
     if (!$Global:CredsRepo.Contains($UserName.ToLower()))
     {
         $Global:CredsRepo += $UserName.ToLower()
     }
 }
 
-function Test-Credentials([string] $UserName)
+function Test-Credentials
 {
+<#
+.SYNOPSIS
+Checks to see if the specified username if already in our central list of
+required credentials.
+
+.DESCRIPTION
+This function checks the central list of required credentials to see if the
+specified user is already part of it. If it finds it, it returns $true,
+otherwise it returns false.
+
+.PARAMETER UserName
+Username to check for existence in the central list of required users.
+
+#>
+    [CmdletBinding()]
+    [OutputType([System.Boolean])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.String]
+        $UserName
+    )
     if ($Global:CredsRepo.Contains($UserName.ToLower()))
     {
         return $true
@@ -480,29 +579,137 @@ function Test-Credentials([string] $UserName)
     return $false
 }
 
-function Convert-DSCStringParamToVariable([string]$DSCBlock, [string]$ParameterName)
+function Convert-DSCStringParamToVariable
 {
-    $startPosition = $DSCBlock.IndexOf($ParameterName)
-    $enfOfLinePosition = $DSCBlock.IndexOf(";`r`n", $startPosition)
+<#
+.SYNOPSIS
+Removes quotes around a parameter in the resulting DSC config, 
+effectively converting it to a variable instead of a string value.
 
+.DESCRIPTION
+This function will scan the content of the current DSC block for the
+resource, find the specified parameter and remove quotes around its
+value so that it becomes a variable instead of a string value.
+
+.PARAMETER DSCBlock
+The string representation of the current DSC resource instance we
+are extracting along with all of its parameters and values.
+
+.PARAMETER ParameterName
+The name of the parameter we wish to convert the value as a variable
+instead of a string value for.
+
+.PARAMETER IsCIMArray
+Represents whether or not the parameter to convert to a variable is an
+array of CIM instances or not. We need to differentiate by explicitely
+passing in this parameter because to the function a CIMArray is nothing
+but a System.Object[] and will threat it as it. CIMArray differ in that
+we should not have commas in between items it contains.
+
+#>
+    [CmdletBinding()]
+    [OutputType([System.String])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.String]
+        $DSCBlock, 
+
+        [Parameter(Mandatory = $true)]
+        [System.String]
+        $ParameterName, 
+        
+        [Parameter()]
+        [System.Boolean]
+        $IsCIMArray = $false
+    )
+    # There is a possibility that a parameter's value will contain the name of the property
+    # or that another property will contain a subset of it.
+    $startPosition = $DSCBlock.IndexOf($ParameterName)
+
+    # If quotes appear before an equal sign, when starting from the assumed start position,
+    # then the start position is invalid, searhc for another instance of the Parameter;
+    $startPosition = -1
+    do
+    {
+        $startPosition = $DSCBlock.IndexOf($ParameterName, $startPosition + 1)
+        $testValidStartPositionEqual = $DSCBlock.IndexOf("=", $startPosition)
+        $testValidStartPositionQuotes = $DSCBlock.IndexOf("`"", $startPosition)
+    } while ($testValidStartPositionEqual -gt $testValidStartPositionQuotes -and 
+             $startPosition -ne -1)
+
+    $endOfLinePosition = $DSCBlock.IndexOf(";`r`n", $startPosition)
+
+    if ($endOfLinePosition -eq -1)
+    {
+        $endOfLinePosition = $DSCBlock.Length
+    }
     $startPosition = $DSCBlock.IndexOf("`"", $startPosition)
 
-    if ($enfOfLinePosition -gt $startPosition)
+    while ($startPosition -ge 0 -and $startPosition -lt $endOfLinePosition)
     {
-        if ($startPosition -ge 0)
+        if ($endOfLinePosition -gt $startPosition)
         {
-            $endPosition = $DSCBlock.IndexOf("`"", $startPosition + 1)
-            if ($endPosition -lt 0)
+            if ($startPosition -ge 0)
             {
-                $endPosition = $DSCBlock.IndexOf("'", $startPosition + 1)
-            }
+                $endPosition = $DSCBlock.IndexOf("`"", $startPosition + 1)
+                if ($endPosition -lt 0)
+                {
+                    $endPosition = $DSCBlock.IndexOf("'", $startPosition + 1)
+                }
 
-            if ($endPosition -ge 0)
-            {
-                $DSCBlock = $DSCBlock.Remove($startPosition, 1)
-                $DSCBlock = $DSCBlock.Remove($endPosition-1, 1)
+                if ($endPosition -ge 0 -and $endPosition -le $endofLinePosition)
+                {
+                    $removeBeginQuotes = $true
+                    $removeEndQuotes = $true
+                    $NewStartPosition = $startPosition
+                    if ($IsCIMArray)
+                    {
+                        $previousEqualSignPosition = $DSCBlock.IndexOf("=", $startPosition -2)
+
+                        # If we have  a CIMArray, and the current quote we are looking at
+                        # is exactly 2 positions before it, we skip remove it because it
+                        # actually is the quotes surrounding a value of an entry of the
+                        # CIMArray. If it was the principal quotes we were looking at removing
+                        # the previous equal sign would be further before due to CIMArray being
+                        # declared as ' = @("MSFT_....';
+                        if (($previousEqualSignPosition - $startPosition -2) -lt 0)
+                        {
+                            $removeBeginQuotes = $false
+                        }
+                        
+                        $previousEqualSignPosition = $DSCBlock.IndexOf("=", $endPosition -2)
+                        $nextNewLinePosition = $DSCBLock.IndexOf("`r`n", $endPosition + 1)
+                        if (($previousEqualSignPosition - $endPosition -2) -lt 0 -or
+                             $nextNewLinePosition -eq ($endPosition +1))
+                        {
+                            $removeEndQuotes = $false
+                            $newStartPosition = $DSCBlock.IndexOf("`r`n", $endPosition)
+                        }
+                    }
+                    
+                    if ($removeBeginQuotes)
+                    {
+                        $DSCBlock = $DSCBlock.Remove($startPosition, 1)
+                    }
+                    if ($removeEndQuotes)
+                    {
+                        $DSCBlock = $DSCBlock.Remove($endPosition-1, 1)
+                    }
+
+                    $startPosition = $newStartPosition
+                }
+                else
+                {
+                    $startPosition = -1
+                }
             }
         }
+        $startPosition = $DSCBlock.IndexOf("`"", $startPosition)
+    }
+
+    if($IsCIMArray)
+    {
+        $DSCBlock = $DSCBlock.Replace("}`r`n,", "`}`r`n")
     }
     return $DSCBlock
 }
@@ -510,8 +717,56 @@ function Convert-DSCStringParamToVariable([string]$DSCBlock, [string]$ParameterN
 <# Region ConfigurationData Methods #>
 $ConfigurationDataContent = @{}
 
-function Add-ConfigurationDataEntry($Node, $Key, $Value, $Description)
+function Add-ConfigurationDataEntry
 {
+<#
+.SYNOPSIS
+Adds a property to the resulting ConfigurationData file from the
+extract.
+
+.DESCRIPTION
+This function helps build the hashtable that will eventually result
+in the ConfigurationData .psd1 file generated by the extraction of
+the configuration. It allows you to speficy what section to add it
+to inside the hashtable, and allows you to speficy a description for
+each one. These description will eventually become comments that
+will appear on top of the property in the ConfigurationData file.
+
+.PARAMETER Node
+Specifies the node entry under which we want to add this parameter
+under. You can also specify NonNodeData names to have the property
+added under custom non-node specific section.
+
+.PARAMETER Key
+The name of the parameter to add.
+
+.PARAMETER Value
+The value of the parameter to add.
+
+.PARAMETER Description
+Description of the parameter to add. This will ultimately appear in
+the generated ConfigurationData .psd1 file as a comment appearing on
+top of the parameter.
+
+#>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.String]
+        $Node,
+
+        [Parameter(Mandatory = $true)]
+        [System.String]
+        $Key,
+
+        [Parameter(Mandatory = $true)]
+        [System.String]
+        $Value, 
+
+        [Parameter()]
+        [System.String]
+        $Description
+    )
     if ($null -eq $ConfigurationDataContent[$Node])
     {
         $ConfigurationDataContent.Add($Node, @{})
@@ -523,8 +778,37 @@ function Add-ConfigurationDataEntry($Node, $Key, $Value, $Description)
     }
 }
 
-function Get-ConfigurationDataEntry($Node, $Key)
+function Get-ConfigurationDataEntry
 {
+<#
+.SYNOPSIS
+Retrieves the value of a given property in the specified node/section
+from the hashtable that is being dynamically built.
+
+.DESCRIPTION
+This function will return the value of the specified parameter from the
+hash table being dynamically built and which will ultimately become the
+content of the ConfigurationData .psd1 file being generated.
+
+.PARAMETER Node
+The name of the node or section in the Hashtable we want to look for
+the key in.
+
+.PARAMETER Key
+The name of the parameter to retrieve the value from.
+
+#>
+    [CmdletBinding()]
+    [OutputType([System.String])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.String]
+        $Node,
+
+        [Parameter(Mandatory = $true)]
+        [System.String]
+        $Key
+    )
     <# If node is null, then search in all nodes and return first result found. #>
     if ($null -eq $Node)
     {
@@ -545,8 +829,22 @@ function Get-ConfigurationDataEntry($Node, $Key)
     }
 }
 
-function Get-$ConfigurationDataContent
+function Get-ConfigurationDataContent
 {
+<#
+.SYNOPSIS
+Retrieves the entire content of the ConfigurationData file being
+dynamically generated.
+
+.DESCRIPTION
+This function will return the content of the dynamically built
+hashtable for the ConfigurationData content as a formatted string.
+
+#>
+    [CmdletBinding()]
+    [OutputType([System.String])]
+    param()
+
     $psd1Content = "@{`r`n"
     $psd1Content += "    AllNodes = @(`r`n"
     foreach ($node in $ConfigurationDataContent.Keys.Where{$_.ToLower() -ne "nonnodedata"})
@@ -640,13 +938,55 @@ function Get-$ConfigurationDataContent
     return $psd1Content
 }
 
-function New-ConfigurationDataDocument($Path)
+function New-ConfigurationDataDocument
 {
-    Get-$ConfigurationDataContent | Out-File -FilePath $Path
+<#
+.SYNOPSIS
+Generates a new ConfigurationData .psd1 file.
+
+.DESCRIPTION
+This function will create the ConfigurationData .psd1 file and store
+the content of the converted hashtable in it.
+
+.PARAMETER Path
+Full file path of the the resulting file will be located.
+
+#>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.String]
+        $Path
+    )
+    Get-ConfigurationDataContent | Out-File -FilePath $Path
 }
 
-function ConvertTo-ConfigurationDataString($PSObject)
+function ConvertTo-ConfigurationDataString
 {
+<#
+.SYNOPSIS
+Converts items from the content of the dynamic hashtable to be used as
+the content of the ConfigurationData .psd1 file into their proper string
+representation.
+
+.DESCRIPTION
+This function will loop through all items inside the dynamic hashtable
+used for the resulting ConfigurationData .psd1 file's content and
+converts each one to the proper string representation based on their
+data type.
+
+.PARAMETER PSObject
+The hashtable object we are building and which is to be used to drive
+the content of the ConfigurationData .psd1 file.
+
+#>
+    [CmdletBinding()]
+    [OutputType([System.String])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Management.Automation.PSObject]
+        $PSObject
+    )
     $configDataContent = ""
     $objectType = $PSObject.GetType().FullName
     switch ($objectType)
@@ -686,8 +1026,32 @@ function ConvertTo-ConfigurationDataString($PSObject)
 <# Region User based Methods #>
 $Global:AllUsers = @()
 
-function Add-ReverseDSCUserName($UserName)
+function Add-ReverseDSCUserName
 {
+<#
+.SYNOPSIS
+Adds the provided username to the list of required users for the
+destination environment.
+
+.DESCRIPTION
+ReverseDSC allows you to keep track of all user credentials encountered
+during various stages of the extraction process. By keeping a central list
+of all users account required by the source environment we can easily
+generate a script that will automatically create new user place holders
+in a destination environment's Active Directory. This function checks
+to see if the specified user was already encountered, and if not adds it
+to the central list of all required users.
+
+.PARAMETER UserName
+Name of the user to add to the central list of required users.
+
+#>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.String]
+        $UserName
+    )
     if (!$Global:AllUsers.Contains($UserName))
     {
         $Global:AllUsers += $UserName
